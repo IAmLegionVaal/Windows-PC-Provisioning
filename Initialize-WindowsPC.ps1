@@ -5,7 +5,7 @@ Audits and optionally applies selected Windows workstation settings.
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [switch]$Apply,
-    [string]$ComputerName,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')][string]$ComputerName,
     [switch]$EnableSystemRestore,
     [switch]$ShowFileExtensions,
     [string[]]$InstallPackageId,
@@ -32,7 +32,7 @@ try{
 
     Get-CimInstance Win32_ComputerSystem|
         Select-Object Name,Manufacturer,Model,Domain,PartOfDomain,TotalPhysicalMemory|
-        Export-Csv (Join-Path $runPath 'Computer.csv') -NoTypeInformation
+        Export-Csv (Join-Path $runPath 'Computer-Before.csv') -NoTypeInformation
     Get-CimInstance Win32_OperatingSystem|
         Select-Object Caption,Version,BuildNumber,OSArchitecture,InstallDate,LastBootUpTime|
         Export-Csv (Join-Path $runPath 'OperatingSystem.csv') -NoTypeInformation
@@ -44,33 +44,42 @@ try{
         Export-Csv (Join-Path $runPath 'NetworkAdapters.csv') -NoTypeInformation
 
     if($Apply -and $ComputerName -and $ComputerName -ne $env:COMPUTERNAME -and $PSCmdlet.ShouldProcess($env:COMPUTERNAME,"Rename computer to $ComputerName")){
-        Rename-Computer -NewName $ComputerName -Force
+        Rename-Computer -NewName $ComputerName -Force -ErrorAction Stop
         'Computer rename requires a restart.'|Out-File (Join-Path $runPath 'RestartRequired.txt')
     }
 
     if($Apply -and $EnableSystemRestore -and $PSCmdlet.ShouldProcess($env:SystemDrive,'Enable System Restore and create restore point')){
         try{
-            Enable-ComputerRestore -Drive ($env:SystemDrive+'\')
-            Checkpoint-Computer -Description 'Windows PC Provisioning' -RestorePointType MODIFY_SETTINGS
+            Enable-ComputerRestore -Drive ($env:SystemDrive+'\') -ErrorAction Stop
+            Checkpoint-Computer -Description 'Windows PC Provisioning' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
         }catch{$warnings.Add("System Restore: $($_.Exception.Message)")}
     }
 
     if($Apply -and $ShowFileExtensions -and $PSCmdlet.ShouldProcess('Current user Explorer settings','Show file extensions')){
         $path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
-        Set-ItemProperty -Path $path -Name HideFileExt -Type DWord -Value 0
+        Set-ItemProperty -Path $path -Name HideFileExt -Type DWord -Value 0 -ErrorAction Stop
+        $hideFileExt=(Get-ItemProperty -Path $path -Name HideFileExt -ErrorAction Stop).HideFileExt
+        if($hideFileExt -ne 0){$warnings.Add('File-extension visibility setting could not be verified.')}
     }
 
     if($Apply -and $InstallPackageId){
         if(-not(Get-Command winget.exe -ErrorAction SilentlyContinue)){$warnings.Add('WinGet was not found.')}
         else{
             foreach($id in $InstallPackageId){
+                if([string]::IsNullOrWhiteSpace($id)){$warnings.Add('An empty WinGet package ID was skipped.');continue}
                 if($PSCmdlet.ShouldProcess($id,'Install package with WinGet')){
-                    winget.exe install --id $id --exact 2>&1|Out-File (Join-Path $runPath ("winget_{0}.txt" -f ($id -replace '[^A-Za-z0-9.-]','_')))
+                    $safeName=$id -replace '[^A-Za-z0-9.-]','_'
+                    winget.exe install --id $id --exact --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1|
+                        Tee-Object -FilePath (Join-Path $runPath ("winget_{0}.txt" -f $safeName))
                     if($LASTEXITCODE -ne 0){$warnings.Add("Package $id returned $LASTEXITCODE")}
                 }
             }
         }
     }
+
+    Get-CimInstance Win32_ComputerSystem|
+        Select-Object Name,Manufacturer,Model,Domain,PartOfDomain,TotalPhysicalMemory|
+        Export-Csv (Join-Path $runPath 'Computer-After.csv') -NoTypeInformation
 
     [pscustomobject]@{
         Computer=$env:COMPUTERNAME
@@ -81,9 +90,9 @@ try{
         PackageCount=@($InstallPackageId).Count
         WarningCount=$warnings.Count
         Completed=Get-Date
-    }|ConvertTo-Json|Out-File (Join-Path $runPath 'Summary.json')
+    }|ConvertTo-Json|Out-File (Join-Path $runPath 'Summary.json') -Encoding UTF8
 
-    $warnings|Out-File (Join-Path $runPath 'Warnings.txt')
+    $warnings|Out-File (Join-Path $runPath 'Warnings.txt') -Encoding UTF8
     if($transcript){Stop-Transcript|Out-Null;$transcript=$false}
     if($warnings.Count -gt 0){Write-Host "[WARN] Completed with warnings. Logs: $runPath" -ForegroundColor Yellow;exit 2}
     Write-Host "[OK] Completed. Logs: $runPath" -ForegroundColor Green;exit 0
